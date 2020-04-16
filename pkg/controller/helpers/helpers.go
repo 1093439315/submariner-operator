@@ -10,6 +10,7 @@ import (
 	"github.com/go-logr/logr"
 	errorutil "github.com/pkg/errors"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -59,3 +60,48 @@ func ReconcileDaemonSet(owner metav1.Object, daemonSet *appsv1.DaemonSet, reqLog
 
 	return daemonSet, errorutil.WithMessagef(err, "error creating or updating DaemonSet %s/%s", daemonSet.Namespace, daemonSet.Name)
 }
+
+func ReconcilePod(owner metav1.Object, pod *corev1.Pod, reqLogger logr.Logger,
+	client client.Client, scheme *runtime.Scheme) (*corev1.Pod, error) {
+		var err error
+
+		// Set the owner and controller
+		if err = controllerutil.SetControllerReference(owner, pod, scheme); err != nil {
+			return nil, err
+		}
+
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			toUpdate := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+				Name:      pod.Name,
+				Namespace: pod.Namespace,
+				Labels:    map[string]string{},
+			}}
+
+			result, err := controllerutil.CreateOrUpdate(context.TODO(), client, toUpdate, func() error {
+				toUpdate.Spec = pod.Spec
+				for k, v := range pod.Labels {
+					toUpdate.Labels[k] = v
+				}
+				return nil
+			})
+
+			if err != nil {
+				return err
+			}
+
+			if result == controllerutil.OperationResultCreated {
+				reqLogger.Info("Created a new DaemonSet", "DaemonSet.Namespace", pod.Namespace, "DaemonSet.Name", pod.Name)
+			} else if result == controllerutil.OperationResultUpdated {
+				reqLogger.Info("Updated existing DaemonSet", "DaemonSet.Namespace", pod.Namespace, "DaemonSet.Name", pod.Name)
+			}
+
+			return nil
+		})
+
+		// Update the status from the server
+		if err == nil {
+			err = client.Get(context.TODO(), types.NamespacedName{Namespace: pod.Namespace, Name: pod.Name}, pod)
+		}
+
+		return pod, errorutil.WithMessagef(err, "error creating or updating DaemonSet %s/%s", pod.Namespace, pod.Name)
+	}

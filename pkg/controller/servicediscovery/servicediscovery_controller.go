@@ -7,7 +7,6 @@ import (
 
 	submarinerv1alpha1 "github.com/submariner-io/submariner-operator/pkg/apis/submariner/v1alpha1"
 	"github.com/submariner-io/submariner-operator/pkg/controller/helpers"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -22,6 +21,11 @@ import (
 )
 
 var log = logf.Log.WithName("controller_servicediscovery")
+
+const (
+	serviceDiscoveryImage = "lighthouse-agent"
+	appName               = "submariner-lighthouse-agent"
+)
 
 // Add creates a new ServiceDiscovery Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
@@ -50,8 +54,8 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 		return err
 	}
 
-	// Watch for changes to secondary resource DaemonSet and requeue the owner ServiceDiscovery
-	err = c.Watch(&source.Kind{Type: &appsv1.DaemonSet{}}, &handler.EnqueueRequestForOwner{
+	// Watch for changes to secondary resource Pod and requeue the owner ServiceDiscovery
+	err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, &handler.EnqueueRequestForOwner{
 		IsController: true,
 		OwnerType:    &submarinerv1alpha1.ServiceDiscovery{},
 	})
@@ -90,33 +94,29 @@ func (r *ReconcileServiceDiscovery) Reconcile(request reconcile.Request) (reconc
 			// Request object not found, could have been deleted after reconcile request.
 			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
 			// Return and don't requeue
-			daemonSet := &appsv1.DaemonSet{}
+			pod := &corev1.Pod{}
 			opts := []client.DeleteAllOfOption{
 				client.InNamespace(request.NamespacedName.Namespace),
 				client.MatchingLabels{"app": appName},
 			}
-			err := r.client.DeleteAllOf(context.TODO(), daemonSet, opts...)
+			err := r.client.DeleteAllOf(context.TODO(), pod, opts...)
 			return reconcile.Result{}, err
 		}
 		// Error reading the object - requeue the request.
 		return reconcile.Result{}, err
 	}
 	lightHouseAgent := newLighthouseAgent(instance)
-	if _, err = helpers.ReconcileDaemonSet(instance, lightHouseAgent, reqLogger,
+	if _, err = helpers.ReconcilePod(instance, lightHouseAgent, reqLogger,
 		r.client, r.scheme); err != nil {
 		return reconcile.Result{}, err
 	}
 	return reconcile.Result{}, nil
 }
 
-func newLighthouseAgent(cr *submarinerv1alpha1.ServiceDiscovery) *appsv1.DaemonSet {
+func newLighthouseAgent(cr *submarinerv1alpha1.ServiceDiscovery) *corev1.Pod {
 	labels := map[string]string{
 		"app":       "submariner-lighthouse-agent",
 		"component": "lighthouse-agent",
-	}
-
-	matchLabels := map[string]string{
-		"app": appName,
 	}
 
 	allowPrivilegeEscalation := true
@@ -133,59 +133,45 @@ func newLighthouseAgent(cr *submarinerv1alpha1.ServiceDiscovery) *appsv1.DaemonS
 
 	terminationGracePeriodSeconds := int64(0)
 
-	serviceDiscoveryDaemonSet := &appsv1.DaemonSet{
+	serviceDiscoveryPod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: cr.Namespace,
 			Name:      "submariner-lighthouse-agent",
 			Labels:    labels,
 		},
-		Spec: appsv1.DaemonSetSpec{
-			Selector: &metav1.LabelSelector{MatchLabels: matchLabels},
-			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: labels,
-				},
-				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{
-						{
-							Name:            "submariner-lighthouse-agent",
-							Image:           getImagePath(cr, serviceDiscoveryImage),
-							ImagePullPolicy: "IfNotPresent",
-							SecurityContext: &securityContext,
-							VolumeMounts: []corev1.VolumeMount{
-								{Name: "host-slash", MountPath: "/host", ReadOnly: true},
-							},
-							Env: []corev1.EnvVar{
-								{Name: "SUBMARINER_NAMESPACE", Value: cr.Spec.Namespace},
-								{Name: "SUBMARINER_CLUSTERID", Value: cr.Spec.ClusterID},
-								{Name: "SUBMARINER_EXCLUDENS", Value: "submariner,kube-system,operators"},
-								{Name: "SUBMARINER_DEBUG", Value: strconv.FormatBool(cr.Spec.Debug)},
-								{Name: "BROKER_K8S_APISERVER", Value: cr.Spec.BrokerK8sApiServer},
-								{Name: "BROKER_K8S_APISERVERTOKEN", Value: cr.Spec.BrokerK8sApiServerToken},
-								{Name: "BROKER_K8S_REMOTENAMESPACE", Value: cr.Spec.BrokerK8sRemoteNamespace},
-								{Name: "BROKER_K8S_CA", Value: cr.Spec.BrokerK8sCA},
-							},
-						},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:            "submariner-lighthouse-agent",
+					Image:           getImagePath(cr, serviceDiscoveryImage),
+					ImagePullPolicy: "IfNotPresent",
+					SecurityContext: &securityContext,
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: "host-slash", MountPath: "/host", ReadOnly: true},
 					},
-					ServiceAccountName:            "submariner-operator",
-					TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
-					NodeSelector:                  map[string]string{"submariner.io/gateway": "true"},
-					HostNetwork:                   true,
-					Volumes: []corev1.Volume{
-						{Name: "host-slash", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/"}}},
+					Env: []corev1.EnvVar{
+						{Name: "SUBMARINER_NAMESPACE", Value: cr.Spec.Namespace},
+						{Name: "SUBMARINER_CLUSTERID", Value: cr.Spec.ClusterID},
+						{Name: "SUBMARINER_EXCLUDENS", Value: "submariner,kube-system,operators"},
+						{Name: "SUBMARINER_DEBUG", Value: strconv.FormatBool(cr.Spec.Debug)},
+						{Name: "BROKER_K8S_APISERVER", Value: cr.Spec.BrokerK8sApiServer},
+						{Name: "BROKER_K8S_APISERVERTOKEN", Value: cr.Spec.BrokerK8sApiServerToken},
+						{Name: "BROKER_K8S_REMOTENAMESPACE", Value: cr.Spec.BrokerK8sRemoteNamespace},
+						{Name: "BROKER_K8S_CA", Value: cr.Spec.BrokerK8sCA},
 					},
 				},
+			},
+			ServiceAccountName:            "submariner-operator",
+			TerminationGracePeriodSeconds: &terminationGracePeriodSeconds,
+			NodeSelector:                  map[string]string{"submariner.io/gateway": "true"},
+			Volumes: []corev1.Volume{
+				{Name: "host-slash", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: "/"}}},
 			},
 		},
 	}
 
-	return serviceDiscoveryDaemonSet
+	return serviceDiscoveryPod
 }
-
-const (
-	serviceDiscoveryImage = "lighthouse-agent"
-	appName               = "submariner-lighthouse-agent"
-)
 
 func getImagePath(submariner *submarinerv1alpha1.ServiceDiscovery, componentImage string) string {
 	var path string
